@@ -1,47 +1,56 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# ============================================
+# Initialize tracking variables
+current_command=""
+last_command=""
+
+# Track last command
+trap 'last_command=$current_command; current_command=$BASH_COMMAND' DEBUG
+
+# Log unexpected exit
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then
+    echo "ERROR: command \"$last_command\" exited with status $rc" >&2
+fi' EXIT
+
+# ============================================================
 # CONFIGURATION
-# ============================================
+# ============================================================
 
-USB_DEV="/dev/sdb"
+USB_DEV="/dev/sda"
+NTFS_LABEL="GRUB-ISO-BOOT-STICK"
 
 MNT_EFI="/mnt/usb-efi"
 MNT_NTFS="/mnt/usb-ntfs"
 
 ISO_DIR="$MNT_NTFS/iso"
 
-# ============================================
+# ============================================================
 # MOUNT PARTITIONS
-# ============================================
+# ============================================================
 
 mkdir -p "$MNT_EFI" "$MNT_NTFS"
-
-echo "[*] Mounting EFI partition..."
 mount "${USB_DEV}1" "$MNT_EFI" || true
-
-echo "[*] Mounting NTFS partition..."
 mount "${USB_DEV}2" "$MNT_NTFS" || true
 
-# ============================================
-# WRITE BASE GRUB CONFIG
-# ============================================
+# ============================================================
+# DETECT GRUB DIRECTORY
+# ============================================================
 
-# Detect GRUB directory on EFI partition
 if [ -d "$MNT_EFI/boot/grub" ]; then
     GRUB_DIR="$MNT_EFI/boot/grub"
 elif [ -d "$MNT_EFI/boot/grub2" ]; then
     GRUB_DIR="$MNT_EFI/boot/grub2"
 else
-    echo "ERROR: Neither grub nor grub2 directory exists under $MNT_EFI/boot"
+    echo "ERROR: No grub directory found"
     exit 1
 fi
 
 GRUB_CFG="$GRUB_DIR/grub.cfg"
-echo "[*] Using GRUB config path: $GRUB_CFG"
 
-echo "[*] Writing base grub.cfg..."
+# ============================================================
+# BASE GRUB CONFIG
+# ============================================================
 
 cat > "$GRUB_CFG" <<EOF
 set timeout=10
@@ -49,71 +58,120 @@ set default=0
 
 menuentry "Reboot" { reboot }
 menuentry "Power Off" { halt }
-
 EOF
 
-# ============================================
-# ADD ISO ENTRIES
-# ============================================
+touch "$MNT_EFI/boot/grub-usb-stick.mark"
 
-echo "[*] Scanning for ISO files..."
+# ============================================================
+# ISO FAMILY DETECTION
+# ============================================================
 
-detect_distro() {
-    local filename="$1"
-    case "$filename" in
-        *ubuntu*|*debian*|*kali*)
-            echo "debian-family"
-            ;;
-        *fedora*|*centos*|*rhel*)
-            echo "redhat-family"
-            ;;
-        *opensuse*|*Leap*|*Slowroll*)
-            echo "opensuse"
-            ;;
-        *arch*)
-            echo "arch"
-            ;;
-        *)
-            echo "unknown"
-            ;;
+detect_family() {
+    local name="$1"
+    shopt -s nocasematch
+    case "$name" in
+        *win7*|*windows7*) echo "windows7" ;;
+        *win8*|*windows8*|*win81*) echo "windows8" ;;
+        *win10*|*windows10*) echo "windows10" ;;
+        *win11*|*windows11*) echo "windows11" ;;
+        *windows*) echo "windows" ;;   # Windows To Go also matches here
+        *ubuntu*|*mint*|*zorin*|*pop-os*) echo "ubuntu" ;;
+        *debian*|*kali*|*parrot*) echo "debian" ;;
+        *fedora*|*centos*|*rhel*|*rocky*|*alma*) echo "redhat" ;;
+        *opensuse*|*suse*|*leap*|*tumbleweed*) echo "opensuse" ;;
+        *arch*|*manjaro*|*endeavouros*) echo "arch" ;;
+        *) echo "unknown" ;;
     esac
+    shopt -u nocasematch
 }
 
-get_kernel_initrd() {
-    local distro="$1"
-    case "$distro" in
-        debian-family)
-            echo "/casper/vmlinuz|/casper/initrd"
-            ;;
-        redhat-family)
-            echo "/isolinux/vmlinuz|/isolinux/initrd.img"
-            ;;
-        opensuse)
-            echo "/boot/x86_64/loader/linux|/boot/x86_64/loader/initrd"
-            ;;
-        arch)
-            echo "/arch/boot/x86_64/vmlinuz|/arch/boot/x86_64/archiso.img"
-            ;;
-        *)
-            echo "|"
-            ;;
-    esac
+# ============================================================
+# AUTO-DETECT KERNEL + INITRD (LINUX)
+# ============================================================
+
+find_kernel_initrd() {
+    local path="$1"
+    kernel_src=""
+    initrd_src=""
+
+    echo "[*] Searching for initrd in: $path"
+
+    # Search for initrd files across the entire directory structure first
+    initrd_src=$(find "$path" -type f \( -iname "initrd*" -o -iname "initramfs*" -o -iname "archiso*.img" -o -iname "*live*.img" \) | head -n 1 || true)
+
+    echo "[*] Initrd search result: $initrd_src"
+
+    # If initrd is found, check the same directory for the kernel
+    if [[ -n "$initrd_src" ]]; then
+        # Get the directory where initrd is located
+        initrd_dir=$(dirname "$initrd_src")
+
+        echo "[*] Searching for kernel in: $initrd_dir"
+
+        # Now, search for kernel (vmlinuz* or bzImage*) in the same directory as initrd
+        kernel_src=$(find "$initrd_dir" -type f \( -iname "vmlinu*" -o -iname "bzImage*" -o -iname "linux*" \) | head -n 1 || true)
+
+        echo "[*] Kernel search result: $kernel_src"
+    fi
+
+    # Check if both kernel and initrd were found
+    if [[ -n "$kernel_src" && -n "$initrd_src" ]]; then
+        echo "[*] Success: kernel and initrd found."
+        return 0  # Success
+    else
+        echo "ERROR: Kernel or Initrd not found for $path"
+        return 1  # Failure
+    fi
 }
 
-get_kernel_params() {
-    local distro="$1"
-    case "$distro" in
-        debian-family)
-            echo "boot=casper iso-scan/filename=\$isofile quiet splash ---"
+
+# ============================================================
+# DETECT SQUASHFS LAYOUT
+# ============================================================
+
+detect_layout() {
+    local path="$1"
+    if [ -f "$path/casper/filesystem.squashfs" ]; then echo "casper"
+    elif [ -f "$path/live/filesystem.squashfs" ]; then echo "live"
+    elif [ -f "$path/LiveOS/squashfs.img" ]; then echo "liveos"
+    elif [ -f "$path/arch/x86_64/airootfs.sfs" ]; then echo "archiso"
+    else echo "generic"
+    fi
+}
+
+# ============================================================
+# LINUX KERNEL PARAMS
+# ============================================================
+
+linux_params() {
+    local family="$1"
+    local folder="$2"
+    local path="$3"
+    local layout=$(detect_layout "$path")
+
+    case "$family" in
+        ubuntu)
+            # with this writing into /cdrom wipes ntfs partition
+            # echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+            echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
             ;;
-        redhat-family)
-            echo "inst.stage2=hd:LABEL=GRUB-ISO-BOOT-STICK:\$isofile quiet"
+        debian)
+            if [ "$layout" = "casper" ]; then
+                # with this writing into /cdrom wipes ntfs partition
+                # echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+                echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+            else
+                echo "boot=live live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/live quiet splash ---"
+            fi
+            ;;
+        redhat)
+            echo "inst.stage2=/iso/$folder quiet"
             ;;
         opensuse)
-            echo "install=hd:LABEL=GRUB-ISO-BOOT-STICK:\$isofile"
+            echo "install=/iso/$folder"
             ;;
         arch)
-            echo "archiso loop=\$isofile"
+            echo "archisodevice=/dev/disk/by-label/$NTFS_LABEL img_dev=/dev/disk/by-label/$NTFS_LABEL img_loop=/iso/$folder/arch/x86_64/airootfs.sfs"
             ;;
         *)
             echo ""
@@ -121,58 +179,131 @@ get_kernel_params() {
     esac
 }
 
-add_grub_entry() {
-    local filename="$1"
-    local name="${filename%.*}"
-    local distro="$2"
-    local kernel="$3"
-    local initrd="$4"
-    local params="$5"
+# ============================================================
+# CHECK IF KERNEL IS SIGNED (to load it with linuxefi)
+# ============================================================
+
+use_signature_checking_loader() {
+    local kernel="$1"
+
+    # Detect PE/COFF signature wrapper
+    if file "$kernel" | grep -q "PE32+" && [ -f "$GRUB_DIR/x86_64-efi/linuxefi.mod" ] ; then
+        return 0  # signed
+    else
+        return 1  # unsigned
+    fi
+}
+
+
+# ============================================================
+# UNIFIED WINDOWS CHAINLOADER ENTRY
+# ============================================================
+
+add_windows_chainloader() {
+    local title="$1"
+    local efi_relpath="$2"
 
     cat >> "$GRUB_CFG" <<EOF
-menuentry "$name (ISO boot)" {
+menuentry "$title" {
     search --file --set=root /boot/grub-usb-stick.mark
     regexp --set=1:disk '^([^,]*).*$' \$root
     set ntfsdev="(\$disk,gpt2)"
-    set isofile="/iso/$filename"
-    loopback loop \$ntfsdev\$isofile
-    linux (loop)$kernel $params
-    initrd (loop)$initrd
+    chainloader \$ntfsdev/$efi_relpath
 }
 EOF
 }
 
-for iso in "$ISO_DIR"/*.iso; do
-    [ -e "$iso" ] || continue
-    filename=$(basename "$iso")
-    echo "[*] Adding ISO: $filename"
+# ============================================================
+# PROCESS WINDOWS SOURCE (ISO + WTG)
+# ============================================================
 
-    distro=$(detect_distro "$filename")
-    ki=$(get_kernel_initrd "$distro")
-    kernel=$(echo "$ki" | cut -d'|' -f1)
-    initrd=$(echo "$ki" | cut -d'|' -f2)
-    params=$(get_kernel_params "$distro")
+process_windows_source() {
+    local folder="$1"
+    local path="$2"
 
-    if [ -n "$kernel" ] && [ -n "$initrd" ]; then
-        add_grub_entry "$filename" "$distro" "$kernel" "$initrd" "$params"
-    else
-        echo "WARNING: No kernel/initrd mapping for $filename"
+    echo "[*] Looking at $folder"
+
+    local efi=""
+    if [ -f "$path/efi/boot/bootx64.efi" ]; then
+        efi="iso/$folder/efi/boot/bootx64.efi"
+    elif [ -f "$path/EFI/BOOT/BOOTX64.EFI" ]; then
+        efi="iso/$folder/EFI/BOOT/BOOTX64.EFI"
+    elif [ -f "$path/efi/microsoft/boot/bootmgfw.efi" ]; then
+        mkdir -p "$path/efi/boot"
+        cp "$path/efi/microsoft/boot/bootmgfw.efi" "$path/efi/boot/bootx64.efi"
+        efi="iso/$folder/efi/boot/bootx64.efi"
+    elif [ -f "$path/EFI/MICROSOFT/BOOT/BOOTMGFW.EFI" ]; then
+        mkdir -p "$path/EFI/BOOT"
+        cp "$path/EFI/MICROSOFT/BOOT/BOOTMGFW.EFI" "$path/EFI/BOOT/BOOTX64.EFI"
+        efi="iso/$folder/EFI/BOOT/BOOTX64.EFI"
     fi
+
+    [[ -n "$efi" ]] || return
+
+    add_windows_chainloader "$folder (Windows)" "$efi"
+    echo "[*] Added Grub Windows entry for $folder."
+}
+
+# ============================================================
+# MAIN LOOP — LINUX + WINDOWS (INSTALLERS + WTG)
+# ============================================================
+
+for path in "$ISO_DIR"/*; do
+    [[ -d "$path" ]] || continue
+    folder=$(basename "$path")
+    family=$(detect_family "$folder")
+
+    echo "[*] Looking at $folder identified as $family"
+
+    case "$family" in
+        windows*|windows)
+            process_windows_source "$folder" "$path"
+            ;;
+        ubuntu|debian|redhat|opensuse|arch)
+            if find_kernel_initrd "$path"; then
+                bootdir="$MNT_EFI/boot/$folder"
+                # TODO: add force param, or opposite, param to not override
+                if [ ! -d  "$bootdir" ] ; then
+                    mkdir -p "$bootdir"
+                    cp "$kernel_src" "$bootdir/vmlinuz"
+                    cp "$initrd_src" "$bootdir/initrd"
+                    echo "[*] Copied kernel and initrd to EFI FAT32 partition"
+                else
+                    echo "[*] Kernel and initrd already on EFI FAT32 partition, nothing copied"
+                fi
+                params=$(linux_params "$family" "$folder" "$path")
+
+                if use_signature_checking_loader "$kernel_src"; then
+                    LINUX_CMD="linuxefi"
+                    INITRD_CMD="initrdefi"
+                else
+                    LINUX_CMD="linux"
+                    INITRD_CMD="initrd"
+                fi
+
+                cat >> "$GRUB_CFG" <<EOF
+menuentry "$folder (Linux)" {
+    search --file --set=root /boot/grub-usb-stick.mark
+    regexp --set=1:disk '^([^,]*).*$' \$root
+    set efidev="(\$disk,gpt1)"
+    $LINUX_CMD \$efidev/boot/$folder/vmlinuz $params
+    $INITRD_CMD \$efidev/boot/$folder/initrd
+}
+EOF
+                echo "[*] Added Grub Linux entry for $folder using $LINUX_CMD/$INITRD_CMD."
+            else
+                echo "ERROR: did not kernel or initrd for $folder"
+            fi
+            ;;
+    esac
 done
 
-
-
-sync
-
-# ============================================
+# ============================================================
 # CLEANUP
-# ============================================
+# ============================================================
 
-sync
-echo "[*] Unmounting..."
-umount "$MNT_EFI"
-umount "$MNT_NTFS"
-rm -r "$MNT_EFI"
-rm -r "$MNT_NTFS"
+umount "$MNT_EFI" || true
+umount "$MNT_NTFS" || true
+rm -r "$MNT_EFI" "$MNT_NTFS"
 
-echo "[*] ISO update complete."
+echo "[*] Multiboot USB updated."
