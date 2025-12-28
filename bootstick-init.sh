@@ -34,6 +34,10 @@ clean_exit() {
 
 USB_DEV=""
 EFI_SIZE=""            # If empty, auto-calculated based on stick size
+ISO_SIZE=""            # If empty, use remaining space after EFI (default behavior)
+EXTRA_SIZE=""          # Optional extra partition size (MB, end of disk)
+DRIVE_SIZE_MB=""
+EXTRA_FS="ntfs"        # Filesystem for extra partition (default: ntfs)
 
 KEEP_PARTITIONS=0      # Do not change partition layout or format any filesystem
 WIPE_EFI_ONLY=0        # Recreate only the EFI filesystem, keep DATA and partition layout
@@ -44,6 +48,7 @@ LOCAL_GRUB="grubx64.efi"
 LOCAL_MMX="mmx64.efi"
 FS_LABEL_BOOT="BSTICK-BOOT" #fat32, max 11 chars.
 FS_LABEL_ISOS="BSTICK-ISOS" #max 16 (ext4 16, ntfs 32)
+FS_LABEL_EXTRA="BSTICK-EXTRA"
 
 MNT_EFI=""
 MNT_NTFS=""
@@ -74,6 +79,15 @@ Options:
                   Typical requirement: ~200M per ISO image
                   If omitted: auto-calc = 5% of stick size but
                   min 200M and max 4000M of stick size
+
+    -i <size>       ISO/data partition size in MB, must end with 'M'
+                                    If omitted: use remaining space after the EFI partition
+    -x <size>       Extra partition size in MB, must end with 'M'
+                                    If provided, an extra partition will be created at the
+                                    end of the disk with this size. If `-i` is omitted the
+                                    script will shrink the ISO partition so the extra partition fits.
+    -F <fs>         Filesystem for extra partition. Supported: ntfs, ext4
+                                    Default: ntfs
 
   -K              KEEP_PARTITIONS:
                   Do not wipe disk or recreate partitions
@@ -110,10 +124,13 @@ clean_exit 1
 # ============================================================
 
 parse_args() {
-    while getopts "d:s:KELNh" opt; do
+    while getopts "d:s:i:x:F:KELNh" opt; do
         case "$opt" in
             d) USB_DEV="$OPTARG" ;;
             s) EFI_SIZE="$OPTARG" ;;
+            i) ISO_SIZE="$OPTARG" ;;
+            x) EXTRA_SIZE="$OPTARG" ;;
+            F) EXTRA_FS="$OPTARG" ;;
             K) KEEP_PARTITIONS=1 ;;
             E) WIPE_EFI_ONLY=1; KEEP_PARTITIONS=1 ;;
             L) USE_LOCAL_EFI=1 ;;
@@ -215,6 +232,32 @@ validate_efi_size() {
     fi
 }
 
+validate_iso_size() {
+    if [[ ! "$ISO_SIZE" =~ ^[0-9]+M$ ]]; then
+        echo "ERROR: ISO/data size must end with 'M' (megabytes)."
+        echo "Example: -i 1024M"
+        clean_exit 1
+    fi
+}
+
+validate_extra_size() {
+    if [[ ! "$EXTRA_SIZE" =~ ^[0-9]+M$ ]]; then
+        echo "ERROR: Extra partition size must end with 'M' (megabytes)."
+        echo "Example: -x 2048M"
+        clean_exit 1
+    fi
+}
+
+validate_extra_fs() {
+    local fs=$(echo "$EXTRA_FS" | tr '[:upper:]' '[:lower:]')
+    if [[ "$fs" != "ntfs" && "$fs" != "ext4" ]]; then
+        echo "ERROR: Unsupported extra partition filesystem: $EXTRA_FS"
+        echo "Supported: ntfs, ext4"
+        clean_exit 1
+    fi
+    EXTRA_FS="$fs"
+}
+
 # ============================================================
 #  EFI SIZE AUTO-CALC
 # ============================================================
@@ -232,6 +275,7 @@ calc_default_efi_size() {
     # Convert to MiB (2048 sectors = 1 MiB)
     local size_mb
     size_mb=$(( sectors / 2048 ))
+    DRIVE_SIZE_MB=$size_mb
 
     # Compute 5%
     local five_percent
@@ -246,6 +290,68 @@ calc_default_efi_size() {
     fi
 
     EFI_SIZE="${efi}M"
+}
+
+
+read_drive_size_mb() {
+    local dev
+    dev=$(basename "$USB_DEV" | sed -E 's/p?[0-9]+$//')
+    if [[ -z "$dev" ]]; then
+        echo "ERROR: Cannot determine device base name for $USB_DEV"
+        clean_exit 1
+    fi
+    if [[ ! -r "/sys/block/$dev/size" ]]; then
+        echo "ERROR: Cannot read /sys/block/$dev/size to determine drive size." 
+        clean_exit 1
+    fi
+    local sectors
+    sectors=$(cat "/sys/block/$dev/size")
+    DRIVE_SIZE_MB=$(( sectors / 2048 ))
+}
+
+
+check_partition_sizes() {
+    read_drive_size_mb
+
+    local efi_mb=${EFI_SIZE%M}
+
+    if [[ -n "$EXTRA_SIZE" && -z "$ISO_SIZE" ]]; then
+        # If extra provided and ISO omitted, shrink ISO to fit
+        local extra_mb=${EXTRA_SIZE%M}
+        local iso_mb=$(( DRIVE_SIZE_MB - efi_mb - extra_mb ))
+        if (( iso_mb <= 0 )); then
+            echo "ERROR: Not enough space on device for EFI (${efi_mb}M) + extra (${extra_mb}M)."
+            echo "Drive total: ${DRIVE_SIZE_MB}M"
+            clean_exit 1
+        fi
+        ISO_SIZE="${iso_mb}M"
+        echo "[*] Calculated ISO/Data size to ${ISO_SIZE} so extra partition fits."
+        validate_iso_size
+    fi
+
+    if [[ -n "$ISO_SIZE" ]]; then
+        validate_iso_size
+    fi
+    if [[ -n "$EXTRA_SIZE" ]]; then
+        validate_extra_size
+    fi
+
+    # Now verify sums don't exceed drive size
+    local iso_mb_final=0
+    if [[ -n "$ISO_SIZE" ]]; then
+        iso_mb_final=${ISO_SIZE%M}
+    fi
+    local extra_mb_final=0
+    if [[ -n "$EXTRA_SIZE" ]]; then
+        extra_mb_final=${EXTRA_SIZE%M}
+    fi
+
+    local sum=$(( efi_mb + iso_mb_final + extra_mb_final ))
+    if (( sum > DRIVE_SIZE_MB )); then
+        echo "ERROR: Requested partition sizes exceed drive size (${sum}M > ${DRIVE_SIZE_MB}M)."
+        echo "EFI: ${efi_mb}M ISO: ${iso_mb_final}M EXTRA: ${extra_mb_final}M"
+        clean_exit 1
+    fi
 }
 
 # ============================================================
@@ -272,7 +378,29 @@ partition_disk() {
     parted -s "$USB_DEV" set 1 esp on
 
     echo "[*] Creating data partition (ext4 by default)..."
-    parted -s "$USB_DEV" mkpart DATA ext4 "$EFI_SIZE" 100%
+    # If EXTRA_SIZE set, we expect check_partition_sizes() to have computed
+    # ISO_SIZE (if omitted) and ensured the sums fit the drive.
+    if [[ -n "$ISO_SIZE" ]]; then
+        local efi_mb=${EFI_SIZE%M}
+        local iso_mb=${ISO_SIZE%M}
+        local iso_end_mb=$(( efi_mb + iso_mb ))
+        parted -s "$USB_DEV" mkpart DATA ext4 "$EFI_SIZE" "${iso_end_mb}MiB"
+    else
+        parted -s "$USB_DEV" mkpart DATA ext4 "$EFI_SIZE" 100%
+    fi
+
+    # Create optional extra partition at the end
+    if [[ -n "$EXTRA_SIZE" ]]; then
+        local iso_end_mb=${EFI_SIZE%M}
+        if [[ -n "$ISO_SIZE" ]]; then
+            iso_end_mb=$(( ${EFI_SIZE%M} + ${ISO_SIZE%M} ))
+        else
+            # If ISO_SIZE was calculated by check_partition_sizes it will be set
+            iso_end_mb=$(( ${EFI_SIZE%M} + ${ISO_SIZE%M} ))
+        fi
+        local extra_end_mb=$(( iso_end_mb + ${EXTRA_SIZE%M} ))
+        parted -s "$USB_DEV" mkpart EXTRA ext4 "${iso_end_mb}MiB" "${extra_end_mb}MiB"
+    fi
 
     sleep 1
 }
@@ -308,6 +436,17 @@ format_partitions() {
     else
         echo "[*] Formatting data partition (${USB_DEV}2) as ext4..."
         mkfs.ext4 -F -L "$FS_LABEL_ISOS" "${USB_DEV}2"
+    fi
+
+    # Format extra partition if requested (partition 3)
+    if [[ -n "$EXTRA_SIZE" ]]; then
+        if [[ "$EXTRA_FS" == "ntfs" ]]; then
+            echo "[*] Formatting extra partition (${USB_DEV}3) as NTFS..."
+            mkfs.ntfs -f -L "$FS_LABEL_EXTRA" "${USB_DEV}3"
+        else
+            echo "[*] Formatting extra partition (${USB_DEV}3) as ext4..."
+            mkfs.ext4 -F -L "$FS_LABEL_EXTRA" "${USB_DEV}3"
+        fi
     fi
 }
 
@@ -455,6 +594,15 @@ main() {
     fi
 
     validate_efi_size
+    if [[ -n "$ISO_SIZE" ]]; then
+        validate_iso_size
+    fi
+    if [[ -n "$EXTRA_SIZE" ]]; then
+        validate_extra_size
+    fi
+
+    # Determine drive size and ensure requested partitions fit
+    check_partition_sizes
     make_mount_dirs
 
     echo "============================================================"
@@ -462,6 +610,16 @@ main() {
     echo "============================================================"
     echo " USB Device:          $USB_DEV"
     echo " EFI Size:            $EFI_SIZE"
+    if [[ -n "$ISO_SIZE" ]]; then
+        echo " ISO/Data Size:       $ISO_SIZE"
+    else
+        echo " ISO/Data Size:       <use remaining space>"
+    fi
+    if [[ -n "$EXTRA_SIZE" ]]; then
+        echo " Extra Partition Size: $EXTRA_SIZE"
+    else
+        echo " Extra Partition Size: <none>"
+    fi
     echo " KEEP_PARTITIONS:     $KEEP_PARTITIONS"
     echo " WIPE_EFI_ONLY:       $WIPE_EFI_ONLY"
     echo " USE_LOCAL_EFI:       $USE_LOCAL_EFI"
