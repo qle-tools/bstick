@@ -327,8 +327,7 @@ mount_partitions() {
         mkdir -p "$MNT_NTFS/iso"
     fi
 
-    mkdir -p "$MNT_EFI/boot"
-    touch "$MNT_EFI/boot/grub-usb-stick.mark"
+    mkdir -p "$MNT_EFI/boot/grub-bstick"
 }
 
 # ============================================================
@@ -406,7 +405,7 @@ install_grub() {
     $GRUBCMD \
         --target=x86_64-efi \
         --efi-directory="$MNT_EFI" \
-        --boot-directory="$MNT_EFI/boot" \
+        --boot-directory="$MNT_EFI/boot/grub-bstick" \
         --removable \
         --no-nvram
 }
@@ -418,12 +417,12 @@ install_grub() {
 write_grub_cfg() {
     local grub_dir
 
-    if [[ -d "$MNT_EFI/boot/grub" ]]; then
-        grub_dir="$MNT_EFI/boot/grub"
-    elif [[ -d "$MNT_EFI/boot/grub2" ]]; then
-        grub_dir="$MNT_EFI/boot/grub2"
+    if [[ -d "$MNT_EFI/boot/grub-bstick/grub" ]]; then
+        grub_dir="$MNT_EFI/boot/grub-bstick/grub"
+    elif [[ -d "$MNT_EFI/boot/grub-bstick/grub2" ]]; then
+        grub_dir="$MNT_EFI/boot/grub-bstick/grub2"
     else
-        echo "ERROR: Neither grub nor grub2 directory exists under $MNT_EFI/boot"
+        echo "ERROR: Neither grub nor grub2 directory exists under $MNT_EFI/boot/grub-bstick"
         clean_exit 1
     fi
 
@@ -433,11 +432,11 @@ write_grub_cfg() {
     echo "[*] Writing initial GRUB config to $cfg"
 
     cat > "$cfg" <<EOF
-set timeout=60
+set timeout=300
 set default=0
 
-menuentry "Reboot" { reboot }
 menuentry "Power Off" { halt }
+menuentry "Reboot" { reboot }
 
 # ISO entries will be added by bootstick-update-iso.sh
 EOF

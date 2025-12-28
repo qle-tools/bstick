@@ -25,6 +25,9 @@ MNT_NTFS="/mnt/usb-ntfs"
 
 ISO_DIR="$MNT_NTFS/iso"
 
+# temp file for loopback.cfg handling
+LOOPBACK_TMP=""
+
 # ============================================================
 # MOUNT PARTITIONS
 # ============================================================
@@ -37,14 +40,16 @@ mount "${USB_DEV}2" "$MNT_NTFS" || true
 # DETECT GRUB DIRECTORY
 # ============================================================
 
-if [ -d "$MNT_EFI/boot/grub" ]; then
-    GRUB_DIR="$MNT_EFI/boot/grub"
-elif [ -d "$MNT_EFI/boot/grub2" ]; then
-    GRUB_DIR="$MNT_EFI/boot/grub2"
+if [ -d "$MNT_EFI/boot/grub-bstick/grub" ]; then
+    GRUB_DIR_NAME="grub"
+elif [ -d "$MNT_EFI/boot/grub-bstick/grub2" ]; then
+    GRUB_DIR_NAME="grub2"
 else
-    echo "ERROR: No grub directory found"
+    echo "ERROR: No grub directory found at MNT_EFI/boot/grub-bstick"
     exit 1
 fi
+
+GRUB_DIR="$MNT_EFI/boot/grub-bstick/$GRUB_DIR_NAME"
 
 GRUB_CFG="$GRUB_DIR/grub.cfg"
 
@@ -53,14 +58,13 @@ GRUB_CFG="$GRUB_DIR/grub.cfg"
 # ============================================================
 
 cat > "$GRUB_CFG" <<EOF
-set timeout=60
+set timeout=300
 set default=0
 
-menuentry "Reboot" { reboot }
 menuentry "Power Off" { halt }
+menuentry "Reboot" { reboot }
 EOF
 
-touch "$MNT_EFI/boot/grub-usb-stick.mark"
 
 # ============================================================
 # ISO FAMILY DETECTION
@@ -124,7 +128,6 @@ find_kernel_initrd() {
     fi
 }
 
-
 # ============================================================
 # DETECT SQUASHFS LAYOUT
 # ============================================================
@@ -149,7 +152,8 @@ linux_params() {
     local family="$1"
     local folder="$2"
     local path="$3"
-    local layout=$(detect_layout "$path")
+    local layout
+    layout=$(detect_layout "$path")
 
     case "$family" in
         ubuntu)
@@ -157,23 +161,11 @@ linux_params() {
             # echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
             # still cdrom, copilot was wrong
             echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
-            # not working with ntfs because initrd has not ntfs support?
-#             local rootfs
-#             rootfs=$(find "$path/casper" -maxdepth 1 -type f -name '*.squashfs' -printf '%s %p\n' \
-#                 | sort -nr | head -n1 | cut -d' ' -f2-)
-#             echo "boot=casper findiso=/iso/$folder/casper/$(basename "$rootfs") quiet splash ---"
             ;;
         debian)
             if [ "$layout" = "casper" ]; then
                 # with this writing into /cdrom can wipe ntfs partition
                 echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
-                # still cdrom, copilot was wrong
-                #echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
-                # not working with ntfs because initrd has not ntfs support?
-#                 local rootfs
-#                 rootfs=$(find "$path/casper" -maxdepth 1 -type f -name '*.squashfs' -printf '%s %p\n' \
-#                     | sort -nr | head -n1 | cut -d' ' -f2-)
-#                 echo "boot=casper findiso=/iso/$folder/casper/$(basename "$rootfs") quiet splash ---"
             else
                 echo "boot=live live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/live quiet splash ---"
             fi
@@ -181,7 +173,7 @@ linux_params() {
         redhat)
             #echo "inst.stage2=/iso/$folder quiet"
             #fedora hacked until it worked:
-            params="root=live:LABEL=$NTFS_LABEL rd.live.image rd.live.dir=/iso/$folder/LiveOS quiet"
+            echo "root=live:LABEL=$NTFS_LABEL rd.live.image rd.live.dir=/iso/$folder/LiveOS quiet"
             ;;
         opensuse)
             echo "install=/iso/$folder"
@@ -192,24 +184,134 @@ linux_params() {
         *)
             echo ""
             ;;
-    esacFS_LABEL_BOOT="BSTICK-BOOT" #fat32, max 11 chars.
+    esac
 }
 
 # ============================================================
-# CHECK IF KERNEL IS SIGNED (to load it with linuxefi)
+# DETECT BROKEN LOOPBACK ISOS (openSUSE, RHEL-family, etc.)
 # ============================================================
 
-use_signature_checking_loader() {
-    local kernel="$1"
+is_broken_loopback_iso() {
+    local path="$1"
 
-    # Detect PE/COFF signature wrapper
-    if file "$kernel" | grep -q "PE32+" && [ -f "$GRUB_DIR/x86_64-efi/linuxefi.mod" ] ; then
-        return 0  # signed
-    else
-        return 1  # unsigned
+    # openSUSE (Leap / Tumbleweed)
+    if [ -f "$path/boot/x86_64/loader/linux" ] && \
+       [ -f "$path/boot/x86_64/loader/initrd" ]; then
+        echo "opensuse"
+        return 0
     fi
+
+    # RHEL / CentOS / Rocky / Alma / Fedora Server / Everything
+    if [ -f "$path/images/install.img" ]; then
+        echo "rhel-like"
+        return 0
+    fi
+
+    return 1
 }
 
+# ============================================================
+# EXTRACT AND PARSE loopback.cfg FROM ISO
+# ============================================================
+
+extract_loopback_cfg() {
+    local iso="$1"
+    local mountdir
+    mountdir=$(mktemp -d)
+
+    # Mount ISO read-only
+    if ! mount -o loop,ro "$iso" "$mountdir" 2>/dev/null; then
+        rmdir "$mountdir"
+        return 1
+    fi
+
+    # Detect broken loopback ISOs
+    local broken_family
+    if broken_family=$(is_broken_loopback_iso "$mountdir"); then
+        echo "[!] Detected broken loopback ISO ($broken_family) — not using loopback boot for this ISO"
+        umount "$mountdir"
+        rmdir "$mountdir"
+        return 3
+    fi
+
+    # Search common loopback.cfg locations
+    local cfg=""
+    for p in \
+        "$mountdir/boot/grub/loopback.cfg" \
+        "$mountdir/boot/grub2/loopback.cfg" \
+        "$mountdir/EFI/BOOT/loopback.cfg" \
+        "$mountdir/loader/loopback.cfg"
+    do
+        if [ -f "$p" ]; then
+            cfg="$p"
+            break
+        fi
+    done
+
+    if [[ -z "$cfg" ]]; then
+        umount "$mountdir"
+        rmdir "$mountdir"
+        return 1
+    fi
+
+    # Fedora-style fake loopback.cfg detection
+    if grep -qE '^[[:space:]]*source[[:space:]]+/boot/grub2/grub.cfg' "$cfg"; then
+        echo "[*] Fedora-style fake loopback.cfg detected — ignoring"
+        umount "$mountdir"
+        rmdir "$mountdir"
+        return 2
+    fi
+
+    # Copy out the file to a temp path
+    LOOPBACK_TMP=$(mktemp)
+    cp "$cfg" "$LOOPBACK_TMP"
+
+    umount "$mountdir"
+    rmdir "$mountdir"
+    return 0
+}
+
+generate_entry_from_loopback() {
+    local iso="$1"
+    local base="$2"
+    local tmp="$LOOPBACK_TMP"
+
+    # Extract first linux/initrd lines
+    local linux_line initrd_line
+    linux_line=$(grep -E "^[[:space:]]*(linux|linuxefi)[[:space:]]" "$tmp" | head -n1 || true)
+    initrd_line=$(grep -E "^[[:space:]]*(initrd|initrdefi)[[:space:]]" "$tmp" | head -n1 || true)
+
+    if [[ -z "$linux_line" || -z "$initrd_line" ]]; then
+        echo "[*] loopback.cfg incomplete — falling back"
+        return 1
+    fi
+
+    # Rewrite ISO filename and device labels in kernel parameters
+    linux_line=$(echo "$linux_line" \
+        | sed "s|iso-scan/filename=[^ ]*|iso-scan/filename=/iso/$iso|" \
+        | sed "s|findiso=[^ ]*|findiso=/iso/$iso|" \
+        | sed "s|img_loop=[^ ]*|img_loop=/iso/$iso|" \
+        | sed "s|archisolabel=[^ ]*|archisolabel=$NTFS_LABEL|" \
+        | sed "s|img_dev=[^ ]*|img_dev=/dev/disk/by-label/$NTFS_LABEL|" \
+        | sed "s|root=live:CDLABEL=[^ ]*|root=live:CDLABEL=$NTFS_LABEL|" \
+        | sed "s|CDLABEL=[^ ]*|CDLABEL=$NTFS_LABEL|")
+
+    # Write GRUB entry using the ISO's own config logic
+    cat >> "$GRUB_CFG" <<EOF
+menuentry "$base (loopback.cfg)" {
+    search --file --set=root /boot/grub-bstick/$GRUB_DIR_NAME/grub.cfg
+    regexp --set=1:disk '^([^,]*).*$' \$root
+    set isodev="(\$disk,gpt2)"
+    loopback loop \$isodev/iso/$iso
+
+    $linux_line
+    $initrd_line
+}
+EOF
+
+    echo "[*] Added loopback.cfg entry for $iso"
+    return 0
+}
 
 # ============================================================
 # UNIFIED WINDOWS CHAINLOADER ENTRY
@@ -221,7 +323,7 @@ add_windows_chainloader() {
 
     cat >> "$GRUB_CFG" <<EOF
 menuentry "$title" {
-    search --file --set=root /boot/grub-usb-stick.mark
+    search --file --set=root /boot/grub-bstick/$GRUB_DIR_NAME/grub.cfg
     regexp --set=1:disk '^([^,]*).*$' \$root
     set ntfsdev="(\$disk,gpt2)"
     chainloader \$ntfsdev/$efi_relpath
@@ -277,8 +379,29 @@ for item in "$ISO_DIR"/*; do
 
         echo "[*] Found ISO file: $iso (family: $family)"
 
+        # Try loopback.cfg / broken-loopback detection first
+        if extract_loopback_cfg "$item"; then
+            # extract_loopback_cfg returned 0: we have a usable loopback.cfg
+            if generate_entry_from_loopback "$iso" "$base"; then
+                rm -f "$LOOPBACK_TMP"
+                continue
+            else
+                rm -f "$LOOPBACK_TMP"
+                echo "[*] loopback.cfg parsing failed, falling back to manual entry"
+            fi
+        else
+            rc=$?
+            if [ "$rc" -eq 3 ]; then
+                # broken loopback ISO detected — do NOT try loopback boot
+                echo "[!] $iso is not loopback-bootable; skipping ISO loopback entry"
+                # You could instead suggest: "extract ISO to directory and reuse extracted mode"
+                continue
+            fi
+            # rc 1 or 2: no loopback.cfg or fake one; fall back to manual logic
+        fi
+
         # ------------------------------
-        # Per‑distro loopback logic
+        # Per‑distro loopback logic (fallback)
         # ------------------------------
         case "$family" in
             ubuntu|debian)
@@ -291,7 +414,6 @@ for item in "$ISO_DIR"/*; do
                 initrd_path="(loop)/isolinux/initrd.img"
                 # for install cd but not live?
                 params="inst.stage2=hd:LABEL=$NTFS_LABEL:/iso/$iso quiet"
-                #params="root=live:LABEL=$NTFS_LABEL rd.live.image rd.live.dir=/iso/$iso/LiveOS quiet"
                 ;;
             opensuse)
                 kernel_path="(loop)/boot/x86_64/loader/linux"
@@ -307,7 +429,7 @@ for item in "$ISO_DIR"/*; do
                 # Windows ISO → chainload bootx64.efi
                 cat >> "$GRUB_CFG" <<EOF
 menuentry "$base (Windows ISO)" {
-    search --file --set=root /boot/grub-usb-stick.mark
+    search --file --set=root /boot/grub-bstick/$GRUB_DIR_NAME/grub.cfg
     regexp --set=1:disk '^([^,]*).*$' \$root
     set ntfsdev="(\$disk,gpt2)"
     loopback loop \$ntfsdev/iso/$iso
@@ -326,11 +448,11 @@ EOF
         esac
 
         # ------------------------------
-        # Write GRUB entry
+        # Write GRUB entry (fallback)
         # ------------------------------
         cat >> "$GRUB_CFG" <<EOF
 menuentry "$base (ISO loopback)" {
-    search --file --set=root /boot/grub-usb-stick.mark
+    search --file --set=root /boot/grub-bstick/$GRUB_DIR_NAME/grub.cfg
     regexp --set=1:disk '^([^,]*).*$' \$root
     set isodev="(\$disk,gpt2)"
     loopback loop \$isodev/iso/$iso
@@ -373,21 +495,13 @@ EOF
 
                 params=$(linux_params "$family" "$folder" "$item")
 
-                if use_signature_checking_loader "$kernel_src"; then
-                    LINUX_CMD="linuxefi"
-                    INITRD_CMD="initrdefi"
-                else
-                    LINUX_CMD="linux"
-                    INITRD_CMD="initrd"
-                fi
-
                 cat >> "$GRUB_CFG" <<EOF
 menuentry "$folder (Linux)" {
-    search --file --set=root /boot/grub-usb-stick.mark
+    search --file --set=root /boot/grub-bstick/$GRUB_DIR_NAME/grub.cfg
     regexp --set=1:disk '^([^,]*).*$' \$root
     set efidev="(\$disk,gpt1)"
-    $LINUX_CMD \$efidev/boot/$folder/vmlinuz $params
-    $INITRD_CMD \$efidev/boot/$folder/initrd
+    linux \$efidev/boot/$folder/vmlinuz $params
+    initrd \$efidev/boot/$folder/initrd
 }
 EOF
                 echo "[*] Added extracted‑ISO Linux entry for $folder"
@@ -408,3 +522,4 @@ umount "$MNT_NTFS" || true
 rm -r "$MNT_EFI" "$MNT_NTFS"
 
 echo "[*] Multiboot USB updated."
+
