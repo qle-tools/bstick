@@ -36,12 +36,14 @@ USB_DEV=""
 EFI_SIZE=""            # If empty, auto-calculated based on stick size
 
 KEEP_PARTITIONS=0      # Do not change partition layout or format any filesystem
-WIPE_EFI_ONLY=0        # Recreate only the EFI filesystem, keep NTFS and partition layout
+WIPE_EFI_ONLY=0        # Recreate only the EFI filesystem, keep DATA and partition layout
 
 USE_LOCAL_EFI=0
 LOCAL_SHIM="shimx64.efi"
 LOCAL_GRUB="grubx64.efi"
 LOCAL_MMX="mmx64.efi"
+FS_LABEL_BOOT="BSTICK-BOOT" #fat32, max 11 chars.
+FS_LABEL_ISOS="BSTICK-ISOS" #max 16 (ext4 16, ntfs 32)
 
 MNT_EFI=""
 MNT_NTFS=""
@@ -49,6 +51,8 @@ MNT_NTFS=""
 SHIM=""
 GRUBEFI=""
 MMX=""
+
+USE_NTFS=0            # Default: data partition is ext4; -N switches to NTFS
 
 # ============================================================
 #  USAGE
@@ -60,7 +64,8 @@ Usage: $0 [OPTIONS]
 
 Prepare a GRUB-based multiboot USB stick with:
   - FAT32 EFI partition (shim, grub, kernels, initrds)
-  - NTFS data partition (ISO directories, squashfs, etc.)
+  - ext4 data partition by default (ISO directories, squashfs, etc.)
+    or NTFS data partition when requested via -N
 
 Options:
   -d <device>     USB device (e.g. /dev/sda)   [REQUIRED]
@@ -76,11 +81,17 @@ Options:
 
   -E              WIPE_EFI_ONLY:
                   Recreate only the FAT32 EFI filesystem (partition 1)
-                  Keep existing partition table and NTFS filesystem
+                  Keep existing partition table and data filesystem
                   (Implies KEEP_PARTITIONS)
 
   -L              Load shim/grub from current directory
                   instead of auto-detecting from /usr
+
+  -N              Format data partition as NTFS instead of ext4.
+                  WARNING: NTFS may prevent ISO booting under strict
+                  Secure Boot and some Linux distributions may fail
+                  to boot or require additional modules when ISO or
+                  squashfs files are stored on NTFS.
 
   -h              Show this help message
 
@@ -88,6 +99,7 @@ Examples:
   $0 -d /dev/sdb
   $0 -d /dev/sdc -s 2000M -L
   $0 -d /dev/sdd -E
+  $0 -d /dev/sde -N
 
 EOF
 clean_exit 1
@@ -98,13 +110,14 @@ clean_exit 1
 # ============================================================
 
 parse_args() {
-    while getopts "d:s:KELh" opt; do
+    while getopts "d:s:KELNh" opt; do
         case "$opt" in
             d) USB_DEV="$OPTARG" ;;
             s) EFI_SIZE="$OPTARG" ;;
             K) KEEP_PARTITIONS=1 ;;
             E) WIPE_EFI_ONLY=1; KEEP_PARTITIONS=1 ;;
             L) USE_LOCAL_EFI=1 ;;
+            N) USE_NTFS=1 ;;
             h) usage ;;
             *) usage ;;
         esac
@@ -115,8 +128,6 @@ parse_args() {
         usage
     fi
 }
-
-parse_args "$@"
 
 # ============================================================
 #  RANDOM MOUNT DIRS
@@ -143,12 +154,12 @@ cleanup_mounts() {
         fi
     fi
 
-    # NTFS
+    # DATA
     if mountpoint -q "$MNT_NTFS"; then
         if ! umount "$MNT_NTFS"; then
             echo "WARNING: Could not unmount $MNT_NTFS — directory left intact."
         else
-            echo "[*] Unmounted $MNT_EFI"
+            echo "[*] Unmounted $MNT_NTFS"
         fi
     fi
 
@@ -172,6 +183,8 @@ cleanup_mounts() {
 
 
 ## trap cleanup_mounts EXIT
+# after cleanup_mounts is defined since it is called
+parse_args "$@"
 
 # ============================================================
 #  VALIDATION
@@ -258,8 +271,8 @@ partition_disk() {
     parted -s "$USB_DEV" mkpart EFI fat32 1MiB "$EFI_SIZE"
     parted -s "$USB_DEV" set 1 esp on
 
-    echo "[*] Creating NTFS data partition..."
-    parted -s "$USB_DEV" mkpart DATA ntfs "$EFI_SIZE" 100%
+    echo "[*] Creating data partition (ext4 by default)..."
+    parted -s "$USB_DEV" mkpart DATA ext4 "$EFI_SIZE" 100%
 
     sleep 1
 }
@@ -278,14 +291,23 @@ format_partitions() {
 
     # Case 2 and 3: We always format EFI unless KEEP_PARTITIONS prevented it
     echo "[*] Formatting EFI partition (${USB_DEV}1) as FAT32..."
-    mkfs.fat -F32 -n GRUB-EFI "${USB_DEV}1"
+    mkfs.fat -F32 -n "$FS_LABEL_BOOT" "${USB_DEV}1"
 
-    # Now decide whether to format NTFS
+    # Now decide whether to format data partition
     if [[ "$WIPE_EFI_ONLY" -eq 1 ]]; then
-        echo "[*] WIPE_EFI_ONLY enabled — NTFS left untouched."
+        echo "[*] WIPE_EFI_ONLY enabled — data partition left untouched."
+        return
+    fi
+
+    if [[ "$USE_NTFS" -eq 1 ]]; then
+        echo "[*] Formatting data partition (${USB_DEV}2) as NTFS..."
+        echo "    WARNING: NTFS may break ISO booting under strict Secure Boot."
+        echo "    Some Linux distributions may not boot correctly when ISO or"
+        echo "    squashfs files reside on NTFS, or may require additional modules."
+        mkfs.ntfs -f -L "$FS_LABEL_ISOS" "${USB_DEV}2"
     else
-        echo "[*] Formatting NTFS partition (${USB_DEV}2) as NTFS..."
-        mkfs.ntfs -f -L GRUB-ISO-BOOT-STICK "${USB_DEV}2"
+        echo "[*] Formatting data partition (${USB_DEV}2) as ext4..."
+        mkfs.ext4 -F -L "$FS_LABEL_ISOS" "${USB_DEV}2"
     fi
 }
 
@@ -298,9 +320,9 @@ mount_partitions() {
     echo "[*] Mounting EFI partition ${USB_DEV}1 at $MNT_EFI..."
     mount "${USB_DEV}1" "$MNT_EFI"
 
-    echo "[*] Mounting NTFS partition ${USB_DEV}2 at $MNT_NTFS..."
+    echo "[*] Mounting data partition ${USB_DEV}2 at $MNT_NTFS..."
     if ! mount "${USB_DEV}2" "$MNT_NTFS"; then
-        echo "WARNING: Could not mount ${USB_DEV}2 — continuing without NTFS."
+        echo "WARNING: Could not mount ${USB_DEV}2 — continuing without data partition."
     else
         mkdir -p "$MNT_NTFS/iso"
     fi
@@ -444,8 +466,13 @@ main() {
     echo " KEEP_PARTITIONS:     $KEEP_PARTITIONS"
     echo " WIPE_EFI_ONLY:       $WIPE_EFI_ONLY"
     echo " USE_LOCAL_EFI:       $USE_LOCAL_EFI"
+    if [[ "$USE_NTFS" -eq 1 ]]; then
+        echo " DATA filesystem:     NTFS"
+    else
+        echo " DATA filesystem:     ext4"
+    fi
     echo " EFI mount dir:       $MNT_EFI"
-    echo " NTFS mount dir:      $MNT_NTFS"
+    echo " DATA mount dir:      $MNT_NTFS"
     echo "============================================================"
 
     partition_disk

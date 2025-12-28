@@ -18,7 +18,7 @@ fi' EXIT
 # ============================================================
 
 USB_DEV="/dev/sda"
-NTFS_LABEL="GRUB-ISO-BOOT-STICK"
+NTFS_LABEL="BSTICK-BOOT" #fat32, max 11 chars.
 
 MNT_EFI="/mnt/usb-efi"
 MNT_NTFS="/mnt/usb-ntfs"
@@ -53,7 +53,7 @@ GRUB_CFG="$GRUB_DIR/grub.cfg"
 # ============================================================
 
 cat > "$GRUB_CFG" <<EOF
-set timeout=10
+set timeout=60
 set default=0
 
 menuentry "Reboot" { reboot }
@@ -179,7 +179,9 @@ linux_params() {
             fi
             ;;
         redhat)
-            echo "inst.stage2=/iso/$folder quiet"
+            #echo "inst.stage2=/iso/$folder quiet"
+            #fedora hacked until it worked:
+            params="root=live:LABEL=$NTFS_LABEL rd.live.image rd.live.dir=/iso/$folder/LiveOS quiet"
             ;;
         opensuse)
             echo "install=/iso/$folder"
@@ -190,7 +192,7 @@ linux_params() {
         *)
             echo ""
             ;;
-    esac
+    esacFS_LABEL_BOOT="BSTICK-BOOT" #fat32, max 11 chars.
 }
 
 # ============================================================
@@ -287,7 +289,9 @@ for item in "$ISO_DIR"/*; do
             redhat)
                 kernel_path="(loop)/isolinux/vmlinuz"
                 initrd_path="(loop)/isolinux/initrd.img"
+                # for install cd but not live?
                 params="inst.stage2=hd:LABEL=$NTFS_LABEL:/iso/$iso quiet"
+                #params="root=live:LABEL=$NTFS_LABEL rd.live.image rd.live.dir=/iso/$iso/LiveOS quiet"
                 ;;
             opensuse)
                 kernel_path="(loop)/boot/x86_64/loader/linux"
