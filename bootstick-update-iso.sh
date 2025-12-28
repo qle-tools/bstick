@@ -131,6 +131,8 @@ find_kernel_initrd() {
 
 detect_layout() {
     local path="$1"
+    # FIXME: TODO: THIS IS WRONG MY UBUNTU HAVE DIFFERENT PATH BUT MAYBE OK FOR DEBIAN. JUST HECK CASPER DIR.
+    # KICK FUNCTION AND USE casper string in rootfs
     if [ -f "$path/casper/filesystem.squashfs" ]; then echo "casper"
     elif [ -f "$path/live/filesystem.squashfs" ]; then echo "live"
     elif [ -f "$path/LiveOS/squashfs.img" ]; then echo "liveos"
@@ -151,15 +153,27 @@ linux_params() {
 
     case "$family" in
         ubuntu)
-            # with this writing into /cdrom wipes ntfs partition
+            # with this writing into /cdrom can wipe ntfs partition
             # echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+            # still cdrom, copilot was wrong
             echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+            # not working with ntfs because initrd has not ntfs support?
+#             local rootfs
+#             rootfs=$(find "$path/casper" -maxdepth 1 -type f -name '*.squashfs' -printf '%s %p\n' \
+#                 | sort -nr | head -n1 | cut -d' ' -f2-)
+#             echo "boot=casper findiso=/iso/$folder/casper/$(basename "$rootfs") quiet splash ---"
             ;;
         debian)
             if [ "$layout" = "casper" ]; then
-                # with this writing into /cdrom wipes ntfs partition
-                # echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
-                echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+                # with this writing into /cdrom can wipe ntfs partition
+                echo "boot=casper live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+                # still cdrom, copilot was wrong
+                #echo "boot=casper root=live:$NTFS_LABEL live-media-path=/iso/$folder/casper quiet splash ---"
+                # not working with ntfs because initrd has not ntfs support?
+#                 local rootfs
+#                 rootfs=$(find "$path/casper" -maxdepth 1 -type f -name '*.squashfs' -printf '%s %p\n' \
+#                     | sort -nr | head -n1 | cut -d' ' -f2-)
+#                 echo "boot=casper findiso=/iso/$folder/casper/$(basename "$rootfs") quiet splash ---"
             else
                 echo "boot=live live-media=/dev/disk/by-label/$NTFS_LABEL live-media-path=/iso/$folder/live quiet splash ---"
             fi
@@ -245,33 +259,115 @@ process_windows_source() {
 }
 
 # ============================================================
-# MAIN LOOP — LINUX + WINDOWS (INSTALLERS + WTG)
+# MAIN LOOP — ISO FILES + EXTRACTED DIRECTORIES
 # ============================================================
 
-for path in "$ISO_DIR"/*; do
-    [[ -d "$path" ]] || continue
-    folder=$(basename "$path")
+for item in "$ISO_DIR"/*; do
+    name=$(basename "$item")
+
+    # ============================================================
+    # CASE 1: ISO FILE → create loopback entry
+    # ============================================================
+    if [[ -f "$item" && "$item" == *.iso ]]; then
+        iso="$name"
+        base="${iso%.iso}"
+        family=$(detect_family "$base")
+
+        echo "[*] Found ISO file: $iso (family: $family)"
+
+        # ------------------------------
+        # Per‑distro loopback logic
+        # ------------------------------
+        case "$family" in
+            ubuntu|debian)
+                kernel_path="(loop)/casper/vmlinuz"
+                initrd_path="(loop)/casper/initrd"
+                params="iso-scan/filename=/iso/$iso quiet splash ---"
+                ;;
+            redhat)
+                kernel_path="(loop)/isolinux/vmlinuz"
+                initrd_path="(loop)/isolinux/initrd.img"
+                params="inst.stage2=hd:LABEL=$NTFS_LABEL:/iso/$iso quiet"
+                ;;
+            opensuse)
+                kernel_path="(loop)/boot/x86_64/loader/linux"
+                initrd_path="(loop)/boot/x86_64/loader/initrd"
+                params="install=hd:LABEL=$NTFS_LABEL:/iso/$iso"
+                ;;
+            arch)
+                kernel_path="(loop)/arch/boot/x86_64/vmlinuz-linux"
+                initrd_path="(loop)/arch/boot/x86_64/archiso.img"
+                params="img_dev=/dev/disk/by-label/$NTFS_LABEL img_loop=/iso/$iso"
+                ;;
+            windows*)
+                # Windows ISO → chainload bootx64.efi
+                cat >> "$GRUB_CFG" <<EOF
+menuentry "$base (Windows ISO)" {
+    search --file --set=root /boot/grub-usb-stick.mark
+    regexp --set=1:disk '^([^,]*).*$' \$root
+    set ntfsdev="(\$disk,gpt2)"
+    loopback loop \$ntfsdev/iso/$iso
+    chainloader (loop)/efi/boot/bootx64.efi
+}
+EOF
+                echo "[*] Added Windows ISO loopback entry for $iso"
+                continue
+                ;;
+            *)
+                # Generic fallback
+                kernel_path="(loop)/casper/vmlinuz"
+                initrd_path="(loop)/casper/initrd"
+                params="iso-scan/filename=/iso/$iso quiet splash ---"
+                ;;
+        esac
+
+        # ------------------------------
+        # Write GRUB entry
+        # ------------------------------
+        cat >> "$GRUB_CFG" <<EOF
+menuentry "$base (ISO loopback)" {
+    search --file --set=root /boot/grub-usb-stick.mark
+    regexp --set=1:disk '^([^,]*).*$' \$root
+    set isodev="(\$disk,gpt2)"
+    loopback loop \$isodev/iso/$iso
+    linux $kernel_path $params
+    initrd $initrd_path
+}
+EOF
+
+        echo "[*] Added loopback ISO entry for $iso"
+        continue
+    fi
+
+    # ============================================================
+    # CASE 2: DIRECTORY → existing extracted‑ISO logic
+    # ============================================================
+    [[ -d "$item" ]] || continue
+
+    folder="$name"
     family=$(detect_family "$folder")
 
-    echo "[*] Looking at $folder identified as $family"
+    echo "[*] Found extracted ISO directory: $folder (family: $family)"
 
     case "$family" in
         windows*|windows)
-            process_windows_source "$folder" "$path"
+            process_windows_source "$folder" "$item"
             ;;
+
         ubuntu|debian|redhat|opensuse|arch)
-            if find_kernel_initrd "$path"; then
+            if find_kernel_initrd "$item"; then
                 bootdir="$MNT_EFI/boot/$folder"
-                # TODO: add force param, or opposite, param to not override
-                if [ ! -d  "$bootdir" ] ; then
+
+                if [ ! -d "$bootdir" ]; then
                     mkdir -p "$bootdir"
                     cp "$kernel_src" "$bootdir/vmlinuz"
                     cp "$initrd_src" "$bootdir/initrd"
-                    echo "[*] Copied kernel and initrd to EFI FAT32 partition"
+                    echo "[*] Copied kernel+initrd to EFI partition"
                 else
-                    echo "[*] Kernel and initrd already on EFI FAT32 partition, nothing copied"
+                    echo "[*] Kernel+initrd already present"
                 fi
-                params=$(linux_params "$family" "$folder" "$path")
+
+                params=$(linux_params "$family" "$folder" "$item")
 
                 if use_signature_checking_loader "$kernel_src"; then
                     LINUX_CMD="linuxefi"
@@ -290,13 +386,14 @@ menuentry "$folder (Linux)" {
     $INITRD_CMD \$efidev/boot/$folder/initrd
 }
 EOF
-                echo "[*] Added Grub Linux entry for $folder using $LINUX_CMD/$INITRD_CMD."
+                echo "[*] Added extracted‑ISO Linux entry for $folder"
             else
-                echo "ERROR: did not kernel or initrd for $folder"
+                echo "ERROR: No kernel/initrd found in $folder"
             fi
             ;;
     esac
 done
+
 
 # ============================================================
 # CLEANUP
